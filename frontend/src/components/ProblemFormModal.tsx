@@ -1,9 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import type { Problem, CreateProblemRequest, UpdateProblemRequest } from '../types';
 import { DIFFICULTY_TAGS } from '../types';
 import { createProblem, updateProblem } from '../services/problemService';
 import { useInterviewStore } from '../store/interview';
 import { useToastStore } from '../store/toast';
+import { BatchImportPanel, type BatchImportedCase } from './BatchImportPanel';
+import type { BatchDelimiter } from '../utils/batchTestCases';
 
 interface ProblemFormModalProps {
   isOpen: boolean;
@@ -44,6 +46,12 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState<'basic' | 'examples' | 'testcases'>('basic');
 
+  // 批量录入草稿：切换标签页/重新打开面板时保留，成功导入或关闭弹窗时清空
+  const [batchText, setBatchText] = useState('');
+  const [batchDelimiter, setBatchDelimiter] = useState<BatchDelimiter>('auto');
+  const [batchPanelOpen, setBatchPanelOpen] = useState(false);
+  const [batchImportCount, setBatchImportCount] = useState(0);
+
   const isEditing = !!editingProblem;
 
   useEffect(() => {
@@ -68,6 +76,10 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     }
     setError('');
     setActiveTab('basic');
+    setBatchText('');
+    setBatchDelimiter('auto');
+    setBatchPanelOpen(false);
+    setBatchImportCount(0);
   }, [editingProblem, isOpen]);
 
   const handleAddExample = () => {
@@ -96,6 +108,29 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     const newTestCases = [...testCases];
     newTestCases[index] = { ...newTestCases[index], [field]: value };
     setTestCases(newTestCases);
+  };
+
+  // 已录入（非空白）的用例，作为批量导入重复检测的基准
+  const existingCasesForBatch: BatchImportedCase[] = useMemo(
+    () =>
+      testCases
+        .filter((t) => t.input.trim() || t.expectedOutput.trim())
+        .map((t) => ({
+          input: t.input.trim(),
+          expectedOutput: t.expectedOutput.trim(),
+          hidden: t.hidden,
+        })),
+    [testCases],
+  );
+
+  const handleBatchImport = (imported: BatchImportedCase[]) => {
+    if (imported.length === 0) return;
+    setTestCases((prev) => [
+      ...prev.filter((t) => t.input.trim() || t.expectedOutput.trim()),
+      ...imported,
+    ]);
+    setBatchImportCount((c) => c + imported.length);
+    setBatchText('');
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -170,6 +205,10 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     setTimeLimit(2000);
     setMemoryLimit(256);
     setError('');
+    setBatchText('');
+    setBatchDelimiter('auto');
+    setBatchPanelOpen(false);
+    setBatchImportCount(0);
     onClose();
   };
 
@@ -379,6 +418,40 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
 
             {activeTab === 'testcases' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                {batchImportCount > 0 && (
+                  <div style={{
+                    padding: '8px 12px',
+                    background: 'rgba(76, 175, 80, 0.1)',
+                    border: '1px solid rgba(76, 175, 80, 0.3)',
+                    borderRadius: '4px',
+                    color: '#4caf50',
+                    fontSize: '13px',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}>
+                    <span>✓ 已通过批量录入导入 {batchImportCount} 条用例，可在下方继续单条编辑或删除</span>
+                    <button
+                      type="button"
+                      onClick={() => setBatchImportCount(0)}
+                      style={{ background: 'transparent', border: 'none', color: '#888', cursor: 'pointer', fontSize: '12px' }}
+                    >
+                      知道了
+                    </button>
+                  </div>
+                )}
+
+                <BatchImportPanel
+                  isOpen={batchPanelOpen}
+                  onToggle={() => setBatchPanelOpen(!batchPanelOpen)}
+                  text={batchText}
+                  onTextChange={setBatchText}
+                  delimiter={batchDelimiter}
+                  onDelimiterChange={setBatchDelimiter}
+                  existingTestCases={existingCasesForBatch}
+                  onImport={handleBatchImport}
+                />
+
                 {testCases.map((testCase, index) => (
                   <div key={index} style={{ background: '#252525', borderRadius: '8px', padding: '16px', border: '1px solid #333' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
