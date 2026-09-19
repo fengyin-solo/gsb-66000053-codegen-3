@@ -1,9 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import type { Problem, CreateProblemRequest, UpdateProblemRequest } from '../types';
 import { DIFFICULTY_TAGS } from '../types';
 import { createProblem, updateProblem } from '../services/problemService';
 import { useInterviewStore } from '../store/interview';
 import { useToastStore } from '../store/toast';
+import {
+  parseBatchTestCases,
+  getValidCases,
+} from '../utils/batchTestCases';
 
 interface ProblemFormModalProps {
   isOpen: boolean;
@@ -31,7 +35,7 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
   editingProblem,
 }) => {
   const { addProblem, updateProblem: updateProblemInStore } = useInterviewStore();
-  const { error: showError } = useToastStore();
+  const { error: showError, success: showSuccess } = useToastStore();
   const [title, setTitle] = useState('');
   const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('easy');
   const [description, setDescription] = useState('');
@@ -43,6 +47,21 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [activeTab, setActiveTab] = useState<'basic' | 'examples' | 'testcases'>('basic');
+
+  // 批量录入草稿状态：切换页签后仍保留，仅在关闭弹窗或完成写入时重置
+  const [batchPanelOpen, setBatchPanelOpen] = useState(false);
+  const [batchText, setBatchText] = useState('');
+  // 行号 -> 预览中手动覆盖的隐藏值
+  const [batchHiddenOverrides, setBatchHiddenOverrides] = useState<Map<number, boolean>>(new Map());
+
+  // 随粘贴文本与已有用例实时解析，修正文本后预览自动刷新（允许修正后重试）
+  const batchResult = useMemo(() => {
+    if (!batchText.trim()) return null;
+    return parseBatchTestCases(
+      batchText,
+      testCases.filter(tc => tc.input.trim() || tc.expectedOutput.trim()),
+    );
+  }, [batchText, testCases]);
 
   const isEditing = !!editingProblem;
 
@@ -68,6 +87,9 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     }
     setError('');
     setActiveTab('basic');
+    setBatchPanelOpen(false);
+    setBatchText('');
+    setBatchHiddenOverrides(new Map());
   }, [editingProblem, isOpen]);
 
   const handleAddExample = () => {
@@ -96,6 +118,64 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     const newTestCases = [...testCases];
     newTestCases[index] = { ...newTestCases[index], [field]: value };
     setTestCases(newTestCases);
+  };
+
+  // 将预览中的隐藏勾选覆盖应用到解析结果
+  const displayResult = useMemo(() => {
+    if (!batchResult) return null;
+    if (batchHiddenOverrides.size === 0) return batchResult;
+    return {
+      ...batchResult,
+      rows: batchResult.rows.map(row =>
+        row.testCase && batchHiddenOverrides.has(row.line)
+          ? { ...row, testCase: { ...row.testCase, hidden: batchHiddenOverrides.get(row.line) as boolean } }
+          : row,
+      ),
+    };
+  }, [batchResult, batchHiddenOverrides]);
+
+  const handleToggleBatchHidden = (line: number) => {
+    // 仅保存预览中手动覆盖的隐藏值；重新解析后按行号仍生效，关闭/写入时清空
+    setBatchHiddenOverrides(prev => {
+      const next = new Map(prev);
+      const current = displayResult?.rows.find(r => r.line === line)?.testCase?.hidden ?? false;
+      next.set(line, !current);
+      return next;
+    });
+  };
+
+  const handleConfirmBatch = () => {
+    if (!displayResult || displayResult.validCount === 0) return;
+
+    // 写入前以当前已有用例再做一次查重，避免预览期间单条列表发生变化
+    const existingKeys = new Set(
+      testCases
+        .filter(tc => tc.input.trim() || tc.expectedOutput.trim())
+        .map(tc => `${tc.input.trim()} ${tc.expectedOutput.trim()}`),
+    );
+
+    const newCases: TestCase[] = [];
+    for (const tc of getValidCases(displayResult)) {
+      const key = `${tc.input.trim()} ${tc.expectedOutput.trim()}`;
+      if (existingKeys.has(key)) continue;
+      existingKeys.add(key);
+      newCases.push({ input: tc.input, expectedOutput: tc.expectedOutput, hidden: tc.hidden });
+    }
+
+    if (newCases.length === 0) {
+      setError('没有可写入的用例：全部与已有用例重复');
+      return;
+    }
+
+    // 追加到已有用例之后；末尾由单条录入留下的全空行保留，不影响原有单条增删
+    setTestCases([...testCases, ...newCases]);
+    showSuccess(`已写入 ${newCases.length} 条测试用例`);
+
+    // 写入完成后收起批量面板并清空草稿
+    setBatchText('');
+    setBatchHiddenOverrides(new Map());
+    setBatchPanelOpen(false);
+    setError('');
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -170,6 +250,9 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     setTimeLimit(2000);
     setMemoryLimit(256);
     setError('');
+    setBatchPanelOpen(false);
+    setBatchText('');
+    setBatchHiddenOverrides(new Map());
     onClose();
   };
 
@@ -202,6 +285,24 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
     minHeight: '120px',
     resize: 'vertical' as const,
     fontFamily: 'monospace',
+  };
+
+  const batchThStyle: React.CSSProperties = {
+    padding: '8px 10px',
+    textAlign: 'left',
+    color: '#aaa',
+    fontWeight: 500,
+    borderBottom: '1px solid #3a3a3a',
+    fontSize: '12px',
+    whiteSpace: 'nowrap',
+  };
+
+  const batchTdStyle: React.CSSProperties = {
+    padding: '8px 10px',
+    color: '#ddd',
+    borderBottom: '1px solid #2f2f2f',
+    verticalAlign: 'top',
+    maxWidth: '280px',
   };
 
   return (
@@ -379,6 +480,199 @@ export const ProblemFormModal: React.FC<ProblemFormModalProps> = ({
 
             {activeTab === 'testcases' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                {/* 批量录入面板 */}
+                <div style={{ background: '#252525', borderRadius: '8px', border: '1px solid #3a3a3a', overflow: 'hidden' }}>
+                  {!batchPanelOpen ? (
+                    <button
+                      type="button"
+                      onClick={() => setBatchPanelOpen(true)}
+                      style={{
+                        width: '100%',
+                        padding: '14px',
+                        border: 'none',
+                        background: 'transparent',
+                        color: '#64b5f6',
+                        cursor: 'pointer',
+                        fontSize: '14px',
+                        textAlign: 'left',
+                      }}
+                    >
+                      📋 批量录入测试用例（粘贴制表符或逗号分隔的多行文本，预览后一次性写入）
+                    </button>
+                  ) : (
+                    <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ color: '#fff', fontWeight: 500, fontSize: '14px' }}>批量录入</span>
+                        <button
+                          type="button"
+                          onClick={() => setBatchPanelOpen(false)}
+                          style={{ background: 'transparent', border: 'none', color: '#888', fontSize: '12px', cursor: 'pointer' }}
+                        >
+                          收起
+                        </button>
+                      </div>
+
+                      <div style={{ color: '#888', fontSize: '12px', lineHeight: 1.7 }}>
+                        每行一条用例，列之间用 <strong style={{ color: '#ccc' }}>Tab（制表符）</strong>或<strong style={{ color: '#ccc' }}>逗号</strong>分隔（整段自动识别；含分隔符的字段可用双引号包裹）：
+                        <br />
+                        · 2 列格式：<code style={{ color: '#ccc' }}>输入 → 期望输出</code>，默认不隐藏；
+                        <br />
+                        · 3 列格式：<code style={{ color: '#ccc' }}>输入 → 期望输出 → 是否隐藏</code>，第 3 列填 是/否、true/false、1/0。
+                        <br />
+                        空行会被忽略；列数不一致、与已有用例或本次粘贴内容重复的行会逐条提示，修正文本后预览自动刷新。
+                      </div>
+
+                      <textarea
+                        value={batchText}
+                        onChange={e => setBatchText(e.target.value)}
+                        placeholder={'1 2\t3\t是\n4 5\t9\t否\n1,2,false'}
+                        style={{ ...textareaStyle, minHeight: '140px', fontSize: '13px' }}
+                        spellCheck={false}
+                      />
+
+                      {displayResult && (
+                        <>
+                          {/* 逐条问题提示 */}
+                          {(displayResult.errorCount > 0 || displayResult.duplicateCount > 0 || displayResult.blankCount > 0) && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '120px', overflowY: 'auto' }}>
+                              {displayResult.rows
+                                .filter(row => row.status !== 'valid')
+                                .map(row => {
+                                  const color =
+                                    row.status === 'error' ? '#f44336' :
+                                    row.status === 'duplicate' ? '#ff9800' : '#9e9e9e';
+                                  const label =
+                                    row.status === 'error' ? '错误' :
+                                    row.status === 'duplicate' ? '重复' : '空行';
+                                  return (
+                                    <div key={row.line} style={{ color, fontSize: '12px', display: 'flex', gap: '8px', alignItems: 'baseline' }}>
+                                      <span style={{ fontWeight: 600, flexShrink: 0 }}>第 {row.line} 行 · {label}</span>
+                                      <span>{row.message}</span>
+                                      {row.raw.trim() && (
+                                        <code style={{ color: '#777', fontSize: '11px', wordBreak: 'break-all' }}>
+                                          原文：{row.raw.length > 60 ? `${row.raw.slice(0, 60)}…` : row.raw}
+                                        </code>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          )}
+
+                          {/* 预览表格 */}
+                          <div style={{ border: '1px solid #3a3a3a', borderRadius: '6px', overflow: 'auto', maxHeight: '280px' }}>
+                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                              <thead>
+                                <tr style={{ background: '#1e1e1e', position: 'sticky', top: 0 }}>
+                                  <th style={batchThStyle}>行</th>
+                                  <th style={batchThStyle}>输入</th>
+                                  <th style={batchThStyle}>期望输出</th>
+                                  <th style={{ ...batchThStyle, width: '70px' }}>是否隐藏</th>
+                                  <th style={{ ...batchThStyle, width: '70px' }}>状态</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {displayResult.rows.map(row => {
+                                  const color =
+                                    row.status === 'valid' ? '#4caf50' :
+                                    row.status === 'error' ? '#f44336' :
+                                    row.status === 'duplicate' ? '#ff9800' : '#9e9e9e';
+                                  const label =
+                                    row.status === 'valid' ? '有效' :
+                                    row.status === 'error' ? '错误' :
+                                    row.status === 'duplicate' ? '重复' : '空行';
+                                  const isWritable = row.status === 'valid';
+                                  return (
+                                    <tr key={row.line} style={{ background: isWritable ? 'transparent' : 'rgba(255,255,255,0.02)' }}>
+                                      <td style={{ ...batchTdStyle, color: '#888', textAlign: 'center', whiteSpace: 'nowrap' }}>{row.line}</td>
+                                      <td style={batchTdStyle}>
+                                        <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                                          {row.testCase ? row.testCase.input : (row.raw.trim() ? row.raw : '—')}
+                                        </span>
+                                      </td>
+                                      <td style={batchTdStyle}>
+                                        <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                                          {row.testCase ? row.testCase.expectedOutput : '—'}
+                                        </span>
+                                      </td>
+                                      <td style={{ ...batchTdStyle, textAlign: 'center' }}>
+                                        {row.testCase ? (
+                                          <input
+                                            type="checkbox"
+                                            checked={row.testCase.hidden}
+                                            disabled={!isWritable}
+                                            onChange={() => handleToggleBatchHidden(row.line)}
+                                            style={{ cursor: isWritable ? 'pointer' : 'not-allowed' }}
+                                          />
+                                        ) : '—'}
+                                      </td>
+                                      <td style={{ ...batchTdStyle, textAlign: 'center', color, whiteSpace: 'nowrap' }}>{label}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+
+                          {/* 汇总与操作 */}
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: '12px', color: '#aaa' }}>
+                              识别到分隔符：{displayResult.delimiter === '\t' ? 'Tab（制表符）' : '逗号'}；
+                              共 <strong style={{ color: '#4caf50' }}>{displayResult.validCount}</strong> 条可写入
+                              {displayResult.blankCount > 0 && <span style={{ color: '#9e9e9e' }}>，{displayResult.blankCount} 行空行将忽略</span>}
+                              {displayResult.errorCount > 0 && <strong style={{ color: '#f44336' }}>，{displayResult.errorCount} 行列数/内容错误</strong>}
+                              {displayResult.duplicateCount > 0 && <strong style={{ color: '#ff9800' }}>，{displayResult.duplicateCount} 行重复</strong>}
+                            </span>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                              <button
+                                type="button"
+                                onClick={() => { setBatchText(''); setBatchHiddenOverrides(new Map()); }}
+                                style={{ padding: '8px 16px', borderRadius: '4px', border: '1px solid #555', background: 'transparent', color: '#ccc', cursor: 'pointer', fontSize: '13px' }}
+                              >
+                                清空
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handleConfirmBatch}
+                                disabled={displayResult.validCount === 0 || displayResult.errorCount > 0 || displayResult.duplicateCount > 0}
+                                title={
+                                  displayResult.errorCount > 0 || displayResult.duplicateCount > 0
+                                    ? '存在错误或重复行，请先按上方提示修正后重试'
+                                    : displayResult.validCount === 0
+                                      ? '没有可写入的用例'
+                                      : ''
+                                }
+                                style={{
+                                  padding: '8px 16px',
+                                  borderRadius: '4px',
+                                  border: 'none',
+                                  background:
+                                    displayResult.validCount === 0 || displayResult.errorCount > 0 || displayResult.duplicateCount > 0
+                                      ? '#3a3a3a' : '#4caf50',
+                                  color:
+                                    displayResult.validCount === 0 || displayResult.errorCount > 0 || displayResult.duplicateCount > 0
+                                      ? '#777' : '#fff',
+                                  cursor:
+                                    displayResult.validCount === 0 || displayResult.errorCount > 0 || displayResult.duplicateCount > 0
+                                      ? 'not-allowed' : 'pointer',
+                                  fontSize: '13px',
+                                }}
+                              >
+                                写入 {displayResult.validCount} 条用例
+                              </button>
+                            </div>
+                          </div>
+                          {(displayResult.errorCount > 0 || displayResult.duplicateCount > 0) && (
+                            <div style={{ fontSize: '12px', color: '#f44336' }}>
+                              请根据上方逐条提示修正粘贴内容（删除空行/重复行、补齐列数），预览会自动刷新，全部通过后即可一次性写入。
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 {testCases.map((testCase, index) => (
                   <div key={index} style={{ background: '#252525', borderRadius: '8px', padding: '16px', border: '1px solid #333' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
